@@ -2,7 +2,13 @@ package napi
 
 /*
 #include <stdlib.h>
+#include <stdint.h>
 #include <node/node_api.h>
+
+// Tokens are integers, never addresses of Go memory. Convert in C so Go's
+// pointer checks do not interpret a handle or ID as a Go pointer.
+static void *napiGoToken(uintptr_t token) { return (void *)token; }
+static uintptr_t napiGoTokenValue(void *token) { return (uintptr_t)token; }
 
 extern void DeleteInstanceData(
 	napi_env env,
@@ -63,6 +69,13 @@ type NapiGoCallbackMapEntry struct {
 	ID       NapiGoCallbackID
 }
 
+// A function owns this handle until its finalizer runs, independently of the
+// environment's instance-data finalizer order.
+type callbackRegistration struct {
+	owner *NapiGoInstanceCallbackData
+	id    NapiGoCallbackID
+}
+
 type NapiGoAsyncWorkID int
 
 type NapiGoInstanceAsyncWorkData struct {
@@ -121,7 +134,7 @@ func DeleteInstanceData(
 	env C.napi_env,
 	finalizeData, finalizeHint unsafe.Pointer,
 ) {
-	instanceDataHandle := cgo.Handle(finalizeData)
+	instanceDataHandle := cgo.Handle(C.napiGoTokenValue(finalizeData))
 	instanceDataHandle.Delete()
 }
 
@@ -130,28 +143,10 @@ func DeleteCallbackData(
 	cEnv C.napi_env,
 	finalizeData, finalizeHint unsafe.Pointer,
 ) {
-	env := Env(cEnv)
-	defer func() {
-		err := recover()
-		if err != nil {
-			fmt.Printf("napi.DeleteCallbackData: Recovered from panic: %s\n", err)
-			reportStackTrace()
-
-			msg := "unknown error"
-			if err, ok := err.(error); ok {
-				msg = err.Error()
-			}
-			ThrowError(env, "", msg)
-		}
-	}()
-
-	instanceData, status := getInstanceData(env)
-	if status != StatusOK {
-		panic(StatusError(status))
-	}
-
-	id := *(*NapiGoCallbackID)(finalizeData)
-	instanceData.GetCallbackData().DeleteCallback(id)
+	handle := cgo.Handle(C.napiGoTokenValue(finalizeData))
+	registration := handle.Value().(callbackRegistration)
+	registration.owner.DeleteCallback(registration.id)
+	handle.Delete()
 }
 
 //export ExecuteCallback
@@ -174,14 +169,9 @@ func ExecuteCallback(
 		}
 	}()
 
-	instanceData, status := getInstanceData(env)
-	if status != StatusOK {
-		panic(StatusError(status))
-	}
-
 	argc := C.size_t(0)
 	var cData unsafe.Pointer
-	status = Status(C.napi_get_cb_info(
+	status := Status(C.napi_get_cb_info(
 		cEnv,
 		cInfo,
 		&argc,
@@ -194,8 +184,8 @@ func ExecuteCallback(
 		panic(StatusError(status))
 	}
 
-	id := *(*NapiGoCallbackID)(cData)
-	callbackData := instanceData.GetCallbackData().GetCallback(id)
+	registration := cgo.Handle(C.napiGoTokenValue(cData)).Value().(callbackRegistration)
+	callbackData := registration.owner.GetCallback(registration.id)
 
 	info := CallbackInfo(cInfo)
 	result := callbackData.Callback(env, info)
@@ -227,7 +217,7 @@ func ExecuteAsyncExecuteCallback(cEnv C.napi_env, cData unsafe.Pointer) {
 		panic(StatusError(status))
 	}
 
-	id := *(*NapiGoAsyncWorkID)(cData)
+	id := NapiGoAsyncWorkID(C.napiGoTokenValue(cData))
 	asyncWorkData := instanceData.GetAsyncWorkData().GetAsyncWork(id)
 	asyncWorkData.Execute(env)
 }
@@ -261,7 +251,7 @@ func ExecuteAsyncCompleteCallback(
 		panic(StatusError(status))
 	}
 
-	id := *(*NapiGoAsyncWorkID)(cData)
+	id := NapiGoAsyncWorkID(C.napiGoTokenValue(cData))
 	asyncWorkData := instanceData.GetAsyncWorkData().GetAsyncWork(id)
 	asyncWorkData.Complete(env, Status(cStatus))
 }
@@ -277,7 +267,7 @@ func getInstanceDataHandle(env Env) (cgo.Handle, Status) {
 		return cgo.Handle(0), status
 	}
 
-	return cgo.Handle(result), status
+	return cgo.Handle(C.napiGoTokenValue(result)), status
 }
 
 func getInstanceData(env Env) (InstanceDataProvider, Status) {
@@ -297,17 +287,19 @@ func setInstanceData(env Env, data *NapiGoInstanceData) Status {
 		return status
 	}
 
-	if handle != 0 {
-		handle.Delete()
-	}
-
 	dataHandle := cgo.NewHandle(data)
-	return Status(C.napi_set_instance_data(
+	status = Status(C.napi_set_instance_data(
 		C.napi_env(env),
-		unsafe.Pointer(dataHandle),
+		C.napiGoToken(C.uintptr_t(dataHandle)),
 		C.napi_finalize(C.DeleteInstanceData),
 		nil,
 	))
+	if status != StatusOK {
+		dataHandle.Delete()
+	} else if handle != 0 {
+		handle.Delete()
+	}
+	return status
 }
 
 func reportStackTrace() {
@@ -344,6 +336,8 @@ func (d *NapiGoInstanceCallbackData) CreateCallback(
 	defer C.free(unsafe.Pointer(cname))
 
 	callbackState := d.insert(cb)
+	handle := cgo.NewHandle(callbackRegistration{owner: d, id: callbackState.ID})
+	data := C.napiGoToken(C.uintptr_t(handle))
 
 	var result Value
 	status := Status(C.napi_create_function(
@@ -351,7 +345,7 @@ func (d *NapiGoInstanceCallbackData) CreateCallback(
 		cname,
 		C.size_t(len([]byte(name))),
 		C.napi_callback(C.ExecuteCallback),
-		unsafe.Pointer(&callbackState.ID),
+		data,
 		(*C.napi_value)(unsafe.Pointer(&result)),
 	))
 
@@ -359,11 +353,17 @@ func (d *NapiGoInstanceCallbackData) CreateCallback(
 		status = Status(C.napi_add_finalizer(
 			C.napi_env(env),
 			C.napi_value(result),
-			unsafe.Pointer(&callbackState.ID),
+			data,
 			C.napi_finalize(C.DeleteCallbackData),
 			nil,
 			nil,
 		))
+	}
+	if status != StatusOK {
+		delete(d.CallbackMap, callbackState.ID)
+		handle.Delete()
+		// A function without a finalizer must never escape to the caller.
+		return nil, status
 	}
 
 	return result, status
@@ -427,9 +427,13 @@ func (d *NapiGoInstanceAsyncWorkData) CreateAsyncWork(
 		C.napi_value(asyncResourceName),
 		C.napi_async_execute_callback(C.ExecuteAsyncExecuteCallback),
 		C.napi_async_complete_callback(C.ExecuteAsyncCompleteCallback),
-		unsafe.Pointer(&asyncWorkState.ID),
+		C.napiGoToken(C.uintptr_t(asyncWorkState.ID)),
 		(*C.napi_async_work)(unsafe.Pointer(&result.Handle)),
 	))
+	if status != StatusOK {
+		delete(d.AsyncWorkMap, asyncWorkState.ID)
+		return AsyncWork{}, status
+	}
 
 	return result, status
 }
